@@ -1,0 +1,978 @@
+================================================================================
+File: src/scripts/download_papers.py
+================================================================================
+# src/scripts/download_papers.py
+import os
+import asyncio
+import aiohttp
+import tarfile
+import tempfile
+import subprocess
+from pathlib import Path
+from loguru import logger
+from fire import Fire
+
+from scripts.tex_utils import find_main_tex_file
+from scripts.pandoc_utils import PandocConverter, create_default_config
+
+
+class ArxivDownloader:
+    def __init__(self, papers_dir: str | Path = "data/papers"):
+        """
+        Initialize the ArXiv paper downloader.
+        
+        Args:
+            papers_dir: Path to store paper files, default "data/papers"
+        """
+        self.papers_dir = Path(papers_dir)
+        self.rate_limit = asyncio.Semaphore(1)  # Only 1 concurrent download
+        self.delay = 3  # 3 second delay between downloads
+        self.headers = {
+            'User-Agent': 'ArxivPaperTracker/1.0'
+        }
+        
+        # Track failed markdown conversions
+        self.failed_markdown_file = self.papers_dir / "failed_markdown.txt"
+        self._load_failed_markdown_ids()
+
+    def _load_failed_markdown_ids(self):
+        """Load the set of arxiv IDs that previously failed markdown conversion."""
+        self.failed_markdown_ids = set()
+        if self.failed_markdown_file.exists():
+            self.failed_markdown_ids = set(
+                line.strip() 
+                for line in self.failed_markdown_file.read_text().splitlines()
+                if line.strip()
+            )
+    
+    def _add_failed_markdown(self, arxiv_id: str):
+        """Add an arxiv ID to the failed markdown tracking file."""
+        if arxiv_id not in self.failed_markdown_ids:
+            self.failed_markdown_ids.add(arxiv_id)
+            with self.failed_markdown_file.open('a') as f:
+                f.write(f"{arxiv_id}\n")
+    
+    def get_papers_missing_files(self) -> list[dict]:
+        """Report current file status for each paper directory."""
+        papers_status = []
+        
+        for paper_dir in self.papers_dir.iterdir():
+            if not paper_dir.is_dir():
+                continue
+
+            arxiv_id = paper_dir.name
+            source_dir = paper_dir / "source"
+            
+            status = {
+                'arxiv_id': arxiv_id,
+                'has_pdf': (paper_dir / f"{arxiv_id}.pdf").exists(),
+                'has_source': source_dir.exists(),
+                'has_markdown': (paper_dir / f"{arxiv_id}.md").exists(),
+                'failed_markdown': arxiv_id in self.failed_markdown_ids
+            }
+            
+            # Only include papers missing any files
+            if not all([status['has_pdf'], status['has_source'], 
+                       status['has_markdown'] or status['failed_markdown']]):
+                papers_status.append(status)
+                
+        return papers_status
+
+    async def process_paper(self, session: aiohttp.ClientSession, paper_status: dict) -> bool:
+        """Process a single paper's downloads and conversions."""
+        arxiv_id = paper_status['arxiv_id']
+        success = True
+        
+        try:
+            if not paper_status['has_pdf']:
+                pdf_success = await self.download_pdf(session, arxiv_id)
+                success = success and pdf_success
+                
+            if not paper_status['has_source']:
+                source_success = await self.download_source(session, arxiv_id)
+                success = success and source_success
+            
+            # Try markdown conversion if:
+            # 1. Paper doesn't have markdown
+            # 2. Hasn't previously failed conversion
+            # 3. Has source files (either pre-existing or just downloaded successfully)
+            if (not paper_status['has_markdown'] and 
+                not paper_status['failed_markdown'] and
+                (paper_status['has_source'] or success)):
+                
+                source_dir = self.papers_dir / arxiv_id / "source"
+                if source_dir.exists():
+                    md_success = self.convert_to_markdown(arxiv_id)
+                    if not md_success:
+                        self._add_failed_markdown(arxiv_id)
+                    success = success and md_success
+        
+        except Exception as e:
+            logger.error(f"Error processing paper {arxiv_id}: {e}")
+            success = False
+            
+        return success
+    
+    def convert_to_markdown(self, arxiv_id: str) -> bool:
+        """Convert LaTeX source to Markdown using enhanced Pandoc conversion."""
+        try:
+            paper_dir = self.papers_dir / arxiv_id
+            source_dir = paper_dir / "source"
+            markdown_file = paper_dir / f"{arxiv_id}.md"
+            
+            if not source_dir.exists():
+                logger.error(f"Source directory not found for {arxiv_id}")
+                return False
+            
+            # Find main tex file
+            tex_files = list(source_dir.rglob('*.tex'))
+            if not tex_files:
+                logger.error(f"No .tex files found for {arxiv_id}")
+                return False
+            
+            main_tex = find_main_tex_file(tex_files, arxiv_id)
+            if not main_tex:
+                logger.error(f"Could not identify main tex file for {arxiv_id}")
+                return False
+                
+            logger.info(f"Converting {main_tex.name} to Markdown for {arxiv_id}")
+            
+            # Set up Pandoc conversion
+            config = create_default_config(paper_dir)
+            converter = PandocConverter(config)
+            
+            # Convert the file
+            success = converter.convert_tex_to_markdown(main_tex, markdown_file)
+            
+            if not success:
+                logger.error(f"Pandoc conversion failed for {arxiv_id}")
+                return False
+                
+            if not markdown_file.exists() or markdown_file.stat().st_size == 0:
+                logger.error(f"Generated markdown file is empty for {arxiv_id}")
+                return False
+            
+            logger.success(f"Successfully converted {arxiv_id} to Markdown")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error converting {arxiv_id} to Markdown: {e}")
+            return False
+            
+    def get_pdf_url(self, arxiv_id: str) -> str:
+        """Get PDF URL from arXiv ID."""
+        return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    
+    def get_source_url(self, arxiv_id: str) -> str:
+        """Get source URL from arXiv ID."""
+        return f"https://arxiv.org/e-print/{arxiv_id}"
+
+    async def download_pdf(self, session: aiohttp.ClientSession, arxiv_id: str) -> bool:
+        """Download PDF for a single paper."""
+        async with self.rate_limit:
+            try:
+                pdf_url = self.get_pdf_url(arxiv_id)
+                paper_dir = self.papers_dir / arxiv_id
+                pdf_path = paper_dir / f"{arxiv_id}.pdf"
+                
+                logger.info(f"Downloading {pdf_path}")
+                
+                async with session.get(pdf_url, headers=self.headers) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to download PDF for {arxiv_id}: {response.status}")
+                        return False
+                        
+                    content = await response.read()
+                    pdf_path.write_bytes(content)
+                    
+                await asyncio.sleep(self.delay)  # Rate limiting delay
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error downloading PDF for {arxiv_id}: {e}")
+                return False
+
+    async def download_source(self, session: aiohttp.ClientSession, arxiv_id: str) -> bool:
+        """Download and extract source files for a single paper."""
+        async with self.rate_limit:
+            try:
+                source_url = self.get_source_url(arxiv_id)
+                paper_dir = self.papers_dir / arxiv_id
+                source_dir = paper_dir / "source"
+                
+                logger.info(f"Downloading {source_dir}")
+                
+                async with session.get(source_url, headers=self.headers) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to download source for {arxiv_id}: {response.status}")
+                        return False
+                        
+                    content = await response.read()
+                    
+                    # Create temporary file for the tar content
+                    with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as tmp_file:
+                        tmp_file.write(content)
+                        tmp_file_path = tmp_file.name
+                    
+                    try:
+                        source_dir.mkdir()
+                        
+                        # Extract tar file
+                        try:
+                            with tarfile.open(tmp_file_path) as tar:
+                                def is_within_directory(directory, target):
+                                    abs_directory = os.path.abspath(directory)
+                                    abs_target = os.path.abspath(target)
+                                    prefix = os.path.commonprefix([abs_directory, abs_target])
+                                    return prefix == abs_directory
+
+                                def safe_extract(tar, path=".", members=None):
+                                    for member in tar.getmembers():
+                                        member_path = os.path.join(path, member.name)
+                                        if not is_within_directory(path, member_path):
+                                            raise Exception("Attempted path traversal in tar file")
+                                    tar.extractall(path=path, members=members)
+
+                                safe_extract(tar, path=source_dir)
+                        except tarfile.ReadError:
+                            # If not a tar file, just copy it as a single file
+                            main_tex = source_dir / "main.tex"
+                            main_tex.write_bytes(content)
+                    finally:
+                        # Clean up temporary file
+                        if os.path.exists(tmp_file_path):
+                            os.unlink(tmp_file_path)
+                    
+                logger.success(f"Successfully downloaded and extracted source for {arxiv_id}")
+                await asyncio.sleep(self.delay)
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error downloading source for {arxiv_id}: {e}")
+                return False
+
+    async def download_all_missing(self):
+        """Download and process all missing files for papers."""
+        papers = self.get_papers_missing_files()
+        if not papers:
+            logger.info("No papers missing files")
+            return
+
+        logger.info(f"Found {len(papers)} papers with missing files")
+        async with aiohttp.ClientSession() as session:
+            tasks = [self.process_paper(session, paper) for paper in papers]
+            results = await asyncio.gather(*tasks)
+            
+            success_count = sum(1 for r in results if r)
+            logger.info(f"Successfully processed {success_count}/{len(papers)} papers")
+
+
+def download_papers(papers_dir: str | Path = "data/papers"):
+    """
+    CLI entry point for downloading missing paper files.
+    
+    Args:
+        papers_dir: Path to store paper files, default "data/papers"
+    """
+    downloader = ArxivDownloader(papers_dir=papers_dir)
+    asyncio.run(downloader.download_all_missing())
+
+def main():
+    """CLI entry point using Fire."""
+    Fire({
+        'download': download_papers
+    })
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================================================
+File: src/scripts/pandoc_utils.py
+================================================================================
+# src/scripts/pandoc_utils.py
+"""Utilities for converting LaTeX papers to Markdown using Pandoc."""
+
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Optional
+from loguru import logger
+from dataclasses import dataclass
+
+@dataclass
+class PandocConfig:
+    """Configuration for Pandoc conversion."""
+    extract_media_dir: Path
+    metadata_file: Optional[Path] = None
+    css_file: Optional[Path] = None
+    bib_file: Optional[Path] = None
+    lua_filter: Optional[Path] = None
+
+class PandocConverter:
+    """Convert LaTeX papers to Markdown using enhanced Pandoc settings."""
+    
+    def __init__(self, config: PandocConfig):
+        """Initialize converter with configuration."""
+        self.config = config
+        self._ensure_directories()
+        self._create_default_files()
+    
+    def _ensure_directories(self):
+        """Ensure all required directories exist."""
+        # Create main media directory
+        try:
+            self.config.extract_media_dir.mkdir(parents=True, exist_ok=True)
+            logger.debug(f"Created media directory: {self.config.extract_media_dir}")
+            
+            # Create parent directories for all configured paths
+            paths_to_check = [
+                self.config.metadata_file,
+                self.config.css_file,
+                self.config.bib_file,
+                self.config.lua_filter
+            ]
+            
+            for path in paths_to_check:
+                if path is not None:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    logger.debug(f"Created directory for: {path}")
+                    
+        except Exception as e:
+            logger.error(f"Error creating directories: {e}")
+            raise
+    
+    def _write_file(self, path: Path, content: str) -> bool:
+        """Write content to file and verify it exists."""
+        try:
+            path.write_text(content)
+            # Verify file was written
+            if not path.exists():
+                logger.error(f"Failed to create file: {path}")
+                return False
+            logger.debug(f"Successfully wrote file: {path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error writing file {path}: {e}")
+            return False
+    
+    def _create_default_files(self):
+        """Create default supporting files if not provided."""
+        # Create and assign paths relative to media directory if not provided
+        if not self.config.lua_filter:
+            self.config.lua_filter = self.config.extract_media_dir / 'crossref.lua'
+        
+        if not self.config.metadata_file:
+            self.config.metadata_file = self.config.extract_media_dir / 'metadata.yaml'
+        
+        # Ensure parent directories exist again (in case paths were just assigned)
+        self._ensure_directories()
+        
+        # Create Lua filter
+        lua_content = '''
+function Math(elem)
+    -- Preserve math content
+    return elem
+end
+
+function Link(elem)
+    -- Handle cross-references
+    return elem
+end
+
+function Image(elem)
+    -- Handle figure references
+    return elem
+end
+
+function Table(elem)
+    -- Handle table formatting
+    return elem
+end
+'''
+        if not self._write_file(self.config.lua_filter, lua_content):
+            raise RuntimeError(f"Failed to create Lua filter: {self.config.lua_filter}")
+        
+        # Create metadata file
+        metadata_content = '''---
+reference-section-title: "References"
+link-citations: true
+citation-style: ieee
+header-includes:
+  - \\usepackage{amsmath}
+  - \\usepackage{amsthm}
+---'''
+        if not self._write_file(self.config.metadata_file, metadata_content):
+            raise RuntimeError(f"Failed to create metadata file: {self.config.metadata_file}")
+        
+        logger.debug("Successfully created all supporting files")
+    
+    def _verify_files_exist(self) -> bool:
+        """Verify that all required files exist before running pandoc."""
+        files_to_check = []
+        
+        if self.config.metadata_file:
+            files_to_check.append(self.config.metadata_file)
+        if self.config.lua_filter:
+            files_to_check.append(self.config.lua_filter)
+        if self.config.css_file:
+            files_to_check.append(self.config.css_file)
+        if self.config.bib_file:
+            files_to_check.append(self.config.bib_file)
+            
+        for file_path in files_to_check:
+            if not file_path.exists():
+                logger.error(f"Required file does not exist: {file_path}")
+                return False
+            logger.debug(f"Verified file exists: {file_path}")
+        
+        return True
+        
+    def build_pandoc_command(self, input_file: Path, output_file: Path) -> list[str]:
+        """Build Pandoc command with all necessary arguments."""
+        cmd = [
+            'pandoc',
+            # Input/output formats
+            '-f', 'latex+raw_tex',
+            '-t', 'gfm',
+            
+            # Math handling
+            '--mathjax',
+            
+            # Table and formatting
+            '--columns=1000',
+            '--wrap=none',
+            '--atx-headers',
+            
+            # Figure handling
+            f'--extract-media={self.config.extract_media_dir.resolve()}',
+            '--standalone',
+            
+            # Debug info
+            '--verbose',
+        ]
+        
+        # Add optional components with absolute paths
+        if self.config.metadata_file and self.config.metadata_file.exists():
+            cmd.extend(['--metadata-file', str(self.config.metadata_file.resolve())])
+            logger.debug(f"Adding metadata file: {self.config.metadata_file.resolve()}")
+        
+        if self.config.css_file and self.config.css_file.exists():
+            cmd.extend(['--css', str(self.config.css_file.resolve())])
+            logger.debug(f"Adding CSS file: {self.config.css_file.resolve()}")
+            
+        if self.config.bib_file and self.config.bib_file.exists():
+            cmd.extend([
+                '--citeproc',
+                '--bibliography', str(self.config.bib_file.resolve())
+            ])
+            logger.debug(f"Adding bibliography file: {self.config.bib_file.resolve()}")
+            
+        if self.config.lua_filter and self.config.lua_filter.exists():
+            cmd.extend(['--lua-filter', str(self.config.lua_filter.resolve())])
+            logger.debug(f"Adding Lua filter: {self.config.lua_filter.resolve()}")
+            
+        # Add input/output files with absolute paths
+        cmd.extend([
+            str(input_file.resolve()),
+            '-o', str(output_file.resolve())
+        ])
+        
+        return cmd
+    
+    def convert_tex_to_markdown(self, tex_file: Path, output_file: Optional[Path] = None) -> bool:
+        """
+        Convert a LaTeX file to Markdown using enhanced Pandoc settings.
+        
+        Args:
+            tex_file: Path to LaTeX file
+            output_file: Optional output path, defaults to same name with .md extension
+            
+        Returns:
+            bool: True if conversion successful
+        """
+        try:
+            if not tex_file.exists():
+                logger.error(f"LaTeX file not found: {tex_file}")
+                return False
+                
+            if not output_file:
+                output_file = tex_file.with_suffix('.md')
+                
+            # Verify all required files exist
+            if not self._verify_files_exist():
+                logger.error("Missing required files for pandoc conversion")
+                return False
+                
+            # Create temporary directory for conversion
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_dir = Path(temp_dir)
+                
+                # Copy LaTeX file to temp directory
+                temp_tex = temp_dir / tex_file.name
+                shutil.copy2(tex_file, temp_tex)
+                if not temp_tex.exists():
+                    logger.error(f"Failed to copy LaTeX file to temp directory: {temp_tex}")
+                    return False
+                
+                # Build and run Pandoc command
+                cmd = self.build_pandoc_command(temp_tex, output_file)
+                logger.debug(f"Running Pandoc command: {' '.join(cmd)}")
+                
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(temp_dir)
+                )
+                
+                if result.returncode != 0:
+                    logger.error(f"Pandoc conversion failed: {result.stderr}")
+                    return False
+                
+                # Verify output file was created
+                if not output_file.exists() or output_file.stat().st_size == 0:
+                    logger.error(f"Output file not created or empty: {output_file}")
+                    return False
+                    
+                logger.success(f"Successfully converted {tex_file} to {output_file}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error converting {tex_file} to Markdown: {e}")
+            return False
+
+def create_default_config(paper_dir: Path) -> PandocConfig:
+    """Create default Pandoc configuration for a paper directory."""
+    media_dir = paper_dir / "media"
+    return PandocConfig(extract_media_dir=media_dir)
+
+
+
+================================================================================
+File: src/scripts/process_events.py
+================================================================================
+# scripts/process_events.py
+import os
+import json
+import yaml
+import asyncio
+import aiohttp
+from datetime import datetime
+from pathlib import Path
+from pydantic import BaseModel, Field
+from loguru import logger
+from llamero.utils import commit_and_push
+
+class Paper(BaseModel):
+    """Schema for paper metadata"""
+    arxiv_id: str = Field(..., alias="arxivId")
+    title: str
+    authors: str
+    abstract: str
+    url: str
+    issue_number: int
+    issue_url: str
+    created_at: str
+    state: str
+    labels: list[str]
+    total_reading_time_minutes: int = 0
+    last_read: str | None = None
+
+    class Config:
+        populate_by_name = True
+
+class ReadingSession(BaseModel):
+    """Schema for reading session events"""
+    type: str = "reading_session"
+    arxiv_id: str = Field(..., alias="arxivId")
+    timestamp: str
+    duration_minutes: int
+    issue_url: str
+
+class PaperRegistrationEvent(BaseModel):
+    """Schema for paper registration events"""
+    type: str = "paper_registered"
+    timestamp: str
+    issue_url: str
+    arxiv_id: str
+
+class EventProcessor:
+    def __init__(self):
+        self.github_token = os.environ["GITHUB_TOKEN"]
+        self.repo = os.environ["GITHUB_REPOSITORY"]
+        self.base_headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        self.papers_dir = Path("data/papers")
+        self.papers_dir.mkdir(parents=True, exist_ok=True)
+        self.modified_files: set[str] = set()
+        self.processed_issues: list[int] = []
+
+    async def get_open_issues(self, session) -> list[dict]:
+        """Fetch all open issues with paper or reading-session labels."""
+        url = f"https://api.github.com/repos/{self.repo}/issues"
+        params = {
+            "state": "open",
+            "per_page": 100
+        }
+        
+        async with session.get(url, headers=self.base_headers, params=params) as response:
+            if response.status == 200:
+                all_issues = await response.json()
+                return [
+                    issue for issue in all_issues
+                    if any(label['name'] in ['paper', 'reading-session'] 
+                          for label in issue['labels'])
+                ]
+            return []
+
+    def create_paper_from_issue(self, issue_data: dict, paper_data: dict) -> Paper:
+        """Create a Paper model from issue and paper data."""
+        return Paper(
+            arxivId=paper_data["arxivId"],
+            title=paper_data.get("title", "Untitled"),
+            authors=paper_data.get("authors", "Unknown"),
+            abstract=paper_data.get("abstract", "").replace('\n', ' '),
+            url=paper_data.get("url", ""),
+            issue_number=issue_data["number"],
+            issue_url=issue_data["html_url"],
+            created_at=issue_data["created_at"],
+            state=issue_data["state"],
+            labels=[label["name"] for label in issue_data["labels"]],
+            total_reading_time_minutes=0,
+            last_read=None
+        )
+
+    def ensure_paper_directory(self, arxiv_id: str) -> Path:
+        """Create paper directory if it doesn't exist."""
+        paper_dir = self.papers_dir / arxiv_id
+        paper_dir.mkdir(parents=True, exist_ok=True)
+        return paper_dir
+
+    def load_paper_metadata(self, arxiv_id: str) -> Paper | None:
+        """Load paper metadata from file."""
+        metadata_file = self.papers_dir / arxiv_id / "metadata.json"
+        if metadata_file.exists():
+            with metadata_file.open('r') as f:
+                data = json.load(f)
+                return Paper.model_validate(data)
+        return None
+
+    def save_paper_metadata(self, paper: Paper):
+        """Save paper metadata to file."""
+        arxiv_id = paper.arxiv_id
+        metadata_file = self.papers_dir / arxiv_id / "metadata.json"
+        with metadata_file.open('w') as f:
+            json.dump(paper.model_dump(by_alias=True), f, indent=2)
+        self.modified_files.add(str(metadata_file))
+
+    def append_event(self, arxiv_id: str, event: BaseModel):
+        """Append an event to the paper's event log."""
+        events_file = self.papers_dir / arxiv_id / "events.log"
+        with events_file.open('a') as f:
+            f.write(f"{event.model_dump_json()}\n")
+        self.modified_files.add(str(events_file))
+
+    def process_new_paper(self, issue_data: dict) -> bool:
+        """Process a new paper registration."""
+        try:
+            paper_data = json.loads(issue_data["body"])
+            arxiv_id = paper_data.get("arxivId")
+            if not arxiv_id:
+                raise ValueError("No arXiv ID found in metadata")
+
+            # Create paper model
+            paper = self.create_paper_from_issue(issue_data, paper_data)
+            
+            # Save paper metadata
+            self.ensure_paper_directory(arxiv_id)
+            self.save_paper_metadata(paper)
+
+            # Log paper creation event
+            event = PaperRegistrationEvent(
+                timestamp=datetime.utcnow().isoformat(),
+                issue_url=issue_data["html_url"],
+                arxiv_id=arxiv_id
+            )
+            self.append_event(arxiv_id, event)
+            self.processed_issues.append(issue_data["number"])
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing new paper: {e}")
+            return False
+
+    def process_reading_session(self, issue_data: dict) -> bool:
+        """Process a reading session event."""
+        try:
+            session_data = json.loads(issue_data["body"])
+            arxiv_id = session_data.get("arxivId")
+            
+            if not arxiv_id:
+                raise ValueError("No arXiv ID found in session data")
+
+            # Load or create paper
+            paper = self.load_paper_metadata(arxiv_id)
+            if not paper:
+                # Create new paper entry if it doesn't exist
+                paper = self.create_paper_from_issue(issue_data, session_data)
+                self.ensure_paper_directory(arxiv_id)
+
+            # Update reading time stats
+            duration_minutes = session_data["duration_minutes"]
+            paper.total_reading_time_minutes += duration_minutes
+            paper.last_read = session_data["timestamp"]
+            
+            # Save updated metadata
+            self.save_paper_metadata(paper)
+
+            # Log reading session event
+            event = ReadingSession(
+                arxivId=arxiv_id,
+                timestamp=session_data["timestamp"],
+                duration_minutes=duration_minutes,
+                issue_url=issue_data["html_url"]
+            )
+            self.append_event(arxiv_id, event)
+            self.processed_issues.append(issue_data["number"])
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing reading session: {e}")
+            return False
+
+    async def close_issues(self, session):
+        """Close all successfully processed issues."""
+        for issue_number in self.processed_issues:
+            url = f"https://api.github.com/repos/{self.repo}/issues/{issue_number}"
+            
+            # Add comment
+            comment_url = f"{url}/comments"
+            comment_data = {
+                "body": "✅ Event processed and recorded. Closing this issue."
+            }
+            async with session.post(comment_url, headers=self.base_headers, json=comment_data) as response:
+                if response.status != 201:
+                    logger.error(f"Failed to add comment to issue {issue_number}")
+                    continue
+
+            # Close issue
+            close_data = {"state": "closed"}
+            async with session.patch(url, headers=self.base_headers, json=close_data) as response:
+                if response.status != 200:
+                    logger.error(f"Failed to close issue {issue_number}")
+
+    def update_registry(self):
+        """Update the centralized registry file with any modified papers."""
+        registry = {}
+        registry_file = Path("data/papers.yaml")
+        
+        # Load existing registry if it exists
+        if registry_file.exists():
+            with registry_file.open('r') as f:
+                registry = yaml.safe_load(f) or {}
+        
+        # Only update entries for modified papers
+        modified_papers = {
+            path.parent.name for path in map(Path, self.modified_files)
+            if "metadata.json" in str(path)
+        }
+        
+        for arxiv_id in modified_papers:
+            paper = self.load_paper_metadata(arxiv_id)
+            if paper:
+                registry[arxiv_id] = paper.model_dump(by_alias=True)
+        
+        # Only save and track if we made changes
+        if modified_papers:
+            with registry_file.open('w') as f:
+                yaml.safe_dump(registry, f, sort_keys=True, indent=2, allow_unicode=True)
+            self.modified_files.add(str(registry_file))
+
+    async def process_all_issues(self):
+        """Process all open issues."""
+        async with aiohttp.ClientSession() as session:
+            issues = await self.get_open_issues(session)
+            
+            for issue in issues:
+                labels = [label["name"] for label in issue["labels"]]
+                
+                if "reading-session" in labels:
+                    self.process_reading_session(issue)
+                elif "paper" in labels:
+                    self.process_new_paper(issue)
+
+            # Update centralized registry if we have any changes
+            if self.modified_files:
+                self.update_registry()
+                try:
+                    # Commit all modified files
+                    commit_and_push(list(self.modified_files))
+                    # Only close issues if commit was successful
+                    await self.close_issues(session)
+                except Exception as e:
+                    logger.error(f"Failed to commit changes: {e}")
+
+def main():
+    """Main entry point for processing paper events."""
+    processor = EventProcessor()
+    asyncio.run(processor.process_all_issues())
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================================================
+File: src/scripts/tex_utils.py
+================================================================================
+# scripts/tex_utils.py
+"""TeX file utilities for arXiv paper processing."""
+
+import re
+from pathlib import Path
+from loguru import logger
+from dataclasses import dataclass
+from typing import Sequence
+
+@dataclass
+class TeXFileScore:
+    """Score details for a TeX file candidate."""
+    path: Path
+    score: int
+    reasons: list[str]
+
+
+
+# Common ML conference and file patterns
+ML_MAIN_FILE_NAMES = {
+    # Standard names
+    'main.tex', 'paper.tex', 'article.tex', 'manuscript.tex',
+    'submission.tex', 'arxiv.tex', 'draft.tex', 'final.tex',
+    # ML/AI Conference specific
+    'neurips.tex', 'neurips_main.tex', 'neurips_camera_ready.tex',
+    'iclr.tex', 'iclr_main.tex', 'iclr_conference.tex', 
+    'icml.tex', 'icml_final.tex', 'icml_conference.tex',
+    'aaai.tex', 'aaai_submission.tex', 'aaai_camera_ready.tex',
+    'acl.tex', 'acl_main.tex', 'acl_camera_ready.tex',
+    'emnlp.tex', 'emnlp_main.tex', 'emnlp_final.tex',
+    'cvpr.tex', 'cvpr_main.tex', 'cvpr_final.tex',
+    'iccv.tex', 'iccv_main.tex', 'iccv_camera_ready.tex',
+    'eccv.tex', 'eccv_main.tex', 'eccv_submission.tex',
+    'mlsys.tex', 'ml4ps.tex', 'ml4md.tex', 'aistats.tex',
+}
+
+ML_CONFERENCE_PATTERNS = [
+    # Major ML conferences
+    r'neurips.*(?:conference|final|main)',
+    r'iclr.*(?:conference|final|main)',
+    r'icml.*(?:conference|final|main)',
+    # NLP conferences
+    r'acl.*(?:conference|final|main)',
+    r'emnlp.*(?:conference|final|main)',
+    r'naacl.*(?:conference|final|main)',
+    # Vision conferences
+    r'cvpr.*(?:conference|final|main)',
+    r'iccv.*(?:conference|final|main)',
+    r'eccv.*(?:conference|final|main)',
+    # AI conferences
+    r'aaai.*(?:conference|final|main)',
+    r'ijcai.*(?:conference|final|main)',
+    # Systems and specialized
+    r'mlsys.*(?:conference|final|main)',
+    r'kdd.*(?:conference|final|main)',
+    r'aistats.*(?:conference|final|main)',
+]
+
+def score_tex_file(tex_file: Path) -> TeXFileScore:
+    """Score a single TeX file based on ML-focused heuristics."""
+    score = 0
+    reasons: list[str] = []
+    
+    try:
+        content = tex_file.read_text(encoding='utf-8', errors='ignore')
+        
+        # File name scoring
+        if tex_file.name.lower() in ML_MAIN_FILE_NAMES:
+            score += 3
+            reasons.append(f"Main filename match (+3): {tex_file.name}")
+        
+        # Conference pattern scoring
+        for pattern in ML_CONFERENCE_PATTERNS:
+            if re.search(pattern, tex_file.name.lower()):
+                score += 3
+                reasons.append(f"Conference pattern match (+3): {pattern}")
+        
+        # Document structure
+        if r'\documentclass' in content:
+            score += 5
+            reasons.append("Has documentclass (+5)")
+        if r'\begin{document}' in content:
+            score += 4
+            reasons.append("Has begin{document} (+4)")
+        if r'\end{document}' in content:
+            score += 4
+            reasons.append("Has end{document} (+4)")
+        
+        # Negative indicators
+        input_count = len(re.findall(r'\\input{', content))
+        include_count = len(re.findall(r'\\include{', content))
+        if input_count + include_count > 0:
+            penalty = -2 if input_count + include_count > 2 else -1
+            score += penalty
+            reasons.append(f"Input/include commands ({penalty})")
+        
+        # File size scoring
+        file_size = len(content)
+        size_score = 0
+        if file_size > 50000:
+            size_score = 4
+        elif file_size > 20000:
+            size_score = 3
+        elif file_size > 10000:
+            size_score = 2
+        elif file_size > 5000:
+            size_score = 1
+        if size_score > 0:
+            score += size_score
+            reasons.append(f"File size {file_size/1000:.1f}KB (+{size_score})")
+            
+    except Exception as e:
+        logger.debug(f"Error processing {tex_file}: {e}")
+        return TeXFileScore(tex_file, 0, [f"Error: {str(e)}"])
+    
+    return TeXFileScore(tex_file, score, reasons)
+
+def find_main_tex_file(tex_files: Sequence[Path], arxiv_id: str = "unknown") -> Path | None:
+    """
+    Find the most likely main TeX file from a list of candidates.
+    
+    Args:
+        tex_files: List of TeX file paths to evaluate
+        arxiv_id: ArXiv ID for logging context
+    
+    Returns:
+        Path to the most likely main TeX file, or None if no valid candidates
+    """
+    if not tex_files:
+        return None
+    
+    # Score all files
+    scored_files = [score_tex_file(f) for f in tex_files]
+    scored_files.sort(key=lambda x: x.score, reverse=True)
+    
+    # Log detailed scoring
+    logger.debug(f"\nTeX file scoring for {arxiv_id}:")
+    for result in scored_files:
+        logger.debug(f"\n{result.path.name}: Total Score = {result.score}")
+        for reason in result.reasons:
+            logger.debug(f"  {reason}")
+    
+    return scored_files[0].path if scored_files else None
+
+
