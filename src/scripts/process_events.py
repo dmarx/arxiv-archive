@@ -149,7 +149,7 @@ class EventProcessor:
         except Exception as e:
             logger.error(f"Error processing new paper: {e}")
             return False
-
+    
     def process_reading_session(self, issue_data: dict) -> bool:
         """Process a reading session event."""
         try:
@@ -157,23 +157,34 @@ class EventProcessor:
             arxiv_id = session_data.get("arxivId")
             
             if not arxiv_id:
-                raise ValueError("No arXiv ID found in session data")
-
-            # Load or create paper
+                logger.error("No arXiv ID found in session data")
+                return False
+    
+            # Validate duration_minutes
+            try:
+                duration_minutes = int(session_data.get("duration_minutes", 0))
+                if duration_minutes <= 0:
+                    logger.error(f"Invalid duration_minutes: {duration_minutes}")
+                    return False
+            except (TypeError, ValueError) as e:
+                logger.error(f"Invalid duration_minutes format: {e}")
+                return False
+                
+            # Ensure paper directory exists
+            self.ensure_paper_directory(arxiv_id)
+                
+            # Load existing paper or create new one
             paper = self.load_paper_metadata(arxiv_id)
             if not paper:
-                # Create new paper entry if it doesn't exist
                 paper = self.create_paper_from_issue(issue_data, session_data)
-                self.ensure_paper_directory(arxiv_id)
-
+                
             # Update reading time stats
-            duration_minutes = session_data["duration_minutes"]
             paper.total_reading_time_minutes += duration_minutes
             paper.last_read = session_data["timestamp"]
             
             # Save updated metadata
             self.save_paper_metadata(paper)
-
+    
             # Log reading session event
             event = ReadingSession(
                 arxivId=arxiv_id,
@@ -184,7 +195,7 @@ class EventProcessor:
             self.append_event(arxiv_id, event)
             self.processed_issues.append(issue_data["number"])
             return True
-
+    
         except Exception as e:
             logger.error(f"Error processing reading session: {e}")
             return False
@@ -209,11 +220,11 @@ class EventProcessor:
             async with session.patch(url, headers=self.base_headers, json=close_data) as response:
                 if response.status != 200:
                     logger.error(f"Failed to close issue {issue_number}")
-
+    
     def update_registry(self):
         """Update the centralized registry file with any modified papers."""
         registry = {}
-        registry_file = Path("data/papers.yaml")
+        registry_file = self.papers_dir.parent / "papers.yaml"
         
         # Load existing registry if it exists
         if registry_file.exists():
@@ -233,6 +244,8 @@ class EventProcessor:
         
         # Only save and track if we made changes
         if modified_papers:
+            # Ensure parent directory exists
+            registry_file.parent.mkdir(parents=True, exist_ok=True)
             with registry_file.open('w') as f:
                 yaml.safe_dump(registry, f, sort_keys=True, indent=2, allow_unicode=True)
             self.modified_files.add(str(registry_file))
