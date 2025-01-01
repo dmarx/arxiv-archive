@@ -1,0 +1,552 @@
+---
+File: .github/workflows/convert-markdown.yml
+---
+# .github/workflows/convert-markdown.yml
+name: Convert Papers to Markdown
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'  # Run every 12 hours
+  workflow_dispatch:
+  
+concurrency:
+  group: ${{ github.repository }}-event-processing
+  cancel-in-progress: false
+  
+jobs:
+  test:
+    uses: ./.github/workflows/test-python.yml
+
+  convert-markdown:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc texlive-base
+          pandoc --version  # Verify installation
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install papers-feed-src/.
+      
+      - name: Convert to markdown
+        run: |
+          python -m scripts.asset_manager convert-markdown
+          python -m scripts.asset_manager retry-failures
+      
+      - name: Commit changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: Convert papers to markdown"
+          file_pattern: |
+            data/papers/**
+
+
+
+---
+File: .github/workflows/deploy_frontend.yaml
+---
+name: Deploy Paper Feed to GitHub Pages
+
+on:
+  push:
+    paths:
+      - 'data/papers/papers.yaml'
+      - 'src/scripts/frontend/**'
+      - '.github/workflows/deploy_frontend.yaml'
+  workflow_dispatch:
+  schedule:
+    # Run daily at midnight UTC
+    - cron: '0 0 * * *'
+
+concurrency:
+  group: ${{ github.repository }}-event-processing
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install papers-feed-src/.
+
+      - name: Generate HTML
+        run: |
+          python -m scripts.frontend.generate_html \
+            --data_path data/papers/papers.yaml \
+            --template_path papers-feed-src/src/scripts/frontend/index.template.html \
+            --output_path web/index.html
+
+      - name: Ensure presence of .nojekyll file
+        run: touch web/.nojekyll
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+  
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./web
+          force_orphan: true # use only latest commit
+
+
+
+---
+File: .github/workflows/download-papers.yml
+---
+# .github/workflows/download-papers.yml
+name: Download Paper Files
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Run every 6 hours
+  workflow_dispatch:
+  
+concurrency:
+  group: ${{ github.repository }}-event-processing
+  cancel-in-progress: false
+  
+jobs:
+  test:
+    uses: ./.github/workflows/test-python.yml
+
+  download-files:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install papers-feed-src/.
+      
+      - name: Download PDFs and Source
+        run: |
+          python -m scripts.asset_manager download-pdfs
+          python -m scripts.asset_manager download-source
+      
+      - name: Commit changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: Download paper files"
+          file_pattern: |
+            data/papers/**
+
+
+
+---
+File: .github/workflows/hard-refresh.yml
+---
+# .github/workflows/hard-refresh.yml
+name: Hard Refresh
+
+on:
+  workflow_dispatch:  # Manual trigger only
+  
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  # First ensure all tests pass
+  test:
+    uses: ./.github/workflows/test-python.yml
+
+  refresh:
+    needs: test  # Wait for tests to pass
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+      
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyGithub
+        pip install papers-feed-src/. 
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pandoc texlive-base
+    
+    - name: Clear data directory and reopen issues
+      run: |
+        python - <<EOF
+        import os
+        import shutil
+        from github import Github
+        
+        # Clear data directory
+        data_dir = "data"
+        if os.path.exists(data_dir):
+            print(f"Removing {data_dir} directory...")
+            shutil.rmtree(data_dir)
+            os.makedirs(data_dir)
+        
+        # Reopen closed paper/reading issues
+        g = Github(os.environ["GITHUB_TOKEN"])
+        repo = g.get_repo(os.environ["GITHUB_REPOSITORY"])
+        
+        for issue in repo.get_issues(state="closed"):
+            labels = [label.name for label in issue.labels]
+            if "wontfix" in labels:
+                continue
+            if "paper" in labels or "reading-session" in labels:
+                print(f"Reopening issue #{issue.number}")
+                issue.edit(state="open")
+        EOF
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Process events
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: python -m scripts.process_events
+  
+    - name: Download PDFs and Source
+      run: |
+        python -m scripts.asset_manager download-pdfs
+        python -m scripts.asset_manager download-source
+
+    - name: Convert to markdown
+      run: |
+        python -m scripts.asset_manager convert-markdown
+        python -m scripts.asset_manager retry-failures
+    
+    - name: Commit and push if there are changes
+      uses: stefanzweifel/git-auto-commit-action@v5
+      with:
+        commit_message: "chore: Hard refresh"
+        file_pattern: |
+          data/**
+
+
+
+---
+File: .github/workflows/llamero-summarize.yaml
+---
+name: Llamero Summarization
+
+on:
+  #push:
+  workflow_dispatch:
+
+jobs:
+  generate-summaries:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install llamero
+      run: pip install llamero
+
+    - name: Generate summaries
+      run: llamero summarize all
+
+
+
+---
+File: .github/workflows/ops-misc.yml
+---
+# .github/workflows/ops-misc.yml
+# General purpose utility operator for one-off operations
+# Executes misc.sh and clears it after successful run
+
+name: Miscellaneous Operations
+
+on:
+  push:
+    paths:
+      - 'ops/misc.sh'
+      - '.github/workflows/ops-misc.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  execute-misc:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Execute and clear misc script
+        run: |
+          bash ops/misc.sh
+          echo '#!/bin/bash' > ops/misc.sh
+
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: executed miscellaneous operation"
+
+
+
+---
+File: .github/workflows/ops-remove-files.yml
+---
+# .github/workflows/remove-files.yml
+# Automated file removal workflow triggered by changes to ops/rm.txt
+# or to this workflow file itself
+
+name: Remove Files
+
+on:
+  push:
+    paths:
+      - 'ops/rm.txt'
+      - '.github/workflows/ops-remove-files.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  remove-files:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Remove files and clear list
+        run: |
+          if [ -s ops/rm.txt ]; then
+            while IFS= read -r pattern; do
+              [ -n "$pattern" ] && find . -path "./$pattern" -type f -delete
+            done < ops/rm.txt
+            : > ops/rm.txt
+          fi
+
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto: Remove files listed in ops/rm.txt"
+
+
+
+---
+File: .github/workflows/process-events.yml
+---
+# .github/workflows/process-events.yml
+name: Process Paper Events
+on:
+  push:
+    paths:
+      - ".github/workflows/process-events.yml"
+  issues:
+    types: [opened]
+    labels:
+      - 'paper'
+      - 'reading-session'
+  # schedule:
+  #   - cron: '0 * * * *'  # Run every hour
+  workflow_call:
+  workflow_dispatch:
+  
+concurrency:
+  group: ${{ github.repository }}-event-processing
+  cancel-in-progress: false
+  
+jobs:
+  process-papers:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install papers-feed-src/.
+      
+      - name: Process Events
+        id: process
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUTPUT=$(python -m scripts.process_events)
+          echo "Debug: Script output: $OUTPUT"
+          if [[ "$OUTPUT" == *"Events processed."* ]]; then
+            echo "SHOULD_TRIGGER=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "SHOULD_TRIGGER=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Conditionally trigger frontend deploy
+        if: ${{ steps.process.outputs.SHOULD_TRIGGER == 'true' }}
+        run: |
+          curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/deploy_frontend.yaml/dispatches \
+            -d '{"ref":"${{ github.ref }}"}'
+
+
+
+---
+File: .github/workflows/test-python.yml
+---
+name: Test Python Scripts
+
+on:
+  push:
+  #   branches: [ main ]
+    paths:
+      - .github/workflows/test-python.yml
+  pull_request:
+  #   branches: [ main ]
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ${{ github.repository }}-test-python
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    # - name: Install pandoc
+    #   run: |
+    #     sudo apt-get update
+    #     sudo apt-get install -y pandoc texlive-base
+    #     pandoc --version  # Verify installation
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e 'papers-feed-src/.[test]'  # Install package in editable mode with test dependencies
+  
+    - name: Run tests
+      run: |
+        pytest tests/ -v --cov=scripts
+
+    - name: Print coverage report
+      run: |
+        coverage report
+
+
+
+---
+File: .github/workflows/update-submodule.yml
+---
+# .github/workflows/update-submodule.yml
+name: Update Submodule
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  push:
+    paths: "./.github/workflows/update-submodule.yml"
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Update submodule
+        run: |
+          git submodule update --recursive --remote
+
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update submodule papers-feed-src"
+          file_pattern: 'papers-feed-src'
+
+

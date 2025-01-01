@@ -1,0 +1,1422 @@
+---
+File: tests/conftest.py
+---
+# tests/conftest.py
+from datetime import datetime
+import pytest
+from pathlib import Path
+from unittest.mock import Mock, patch
+from scripts.models import Paper
+
+
+@pytest.fixture
+def mock_pandoc():
+    """Mock pandoc for all tests."""
+    def mock_pandoc_run(cmd, capture_output=False, cwd=None, text=True):
+        mock_result = Mock()
+        mock_result.returncode = 0
+        mock_result.stdout = "Success"
+        mock_result.stderr = ""
+        
+        # Handle output file creation
+        try:
+            output_idx = cmd.index('-o')
+            if output_idx + 1 < len(cmd):
+                output_file = Path(cmd[output_idx + 1])
+                output_file.write_text("# Mock Pandoc Output\n\nConverted content\n")
+        except (ValueError, IndexError):
+            pass
+            
+        return mock_result
+
+    with patch('subprocess.run', side_effect=mock_pandoc_run):
+        yield
+
+@pytest.fixture
+def test_dir(tmp_path):
+    """Create a clean test directory."""
+    return tmp_path / "papers"
+
+@pytest.fixture
+def paper_dir(test_dir):
+    """Create a test paper directory."""
+    paper_dir = test_dir / "2401.00001"
+    paper_dir.mkdir(parents=True)
+    return paper_dir
+
+@pytest.fixture
+def sample_paper():
+    """Create sample Paper object."""
+    return Paper(
+        arxivId="2401.00001",
+        title="Test Paper",
+        authors="Test Author",
+        abstract="Test Abstract",
+        url="https://arxiv.org/abs/2401.00001",
+        issue_number=1,
+        issue_url="https://github.com/user/repo/issues/1",
+        created_at=datetime.utcnow().isoformat(),
+        state="open",
+        labels=["paper"],
+        total_reading_time_seconds=0,
+        last_read=None
+    )
+
+@pytest.fixture
+def source_dir(paper_dir):
+    """Create source directory with test TeX content."""
+    source_dir = paper_dir / "source"
+    source_dir.mkdir()
+    
+    main_tex = source_dir / "main.tex"
+    main_tex.write_text(r"""
+\documentclass{article}
+\begin{document}
+\title{Test Document}
+\maketitle
+\section{Introduction}
+Test content
+\end{document}
+""")
+    
+    return source_dir
+
+
+
+---
+File: tests/test_arxiv_client.py
+---
+# tests/test_arxiv_client.py
+import pytest
+from pathlib import Path
+from io import StringIO
+import tarfile
+import tempfile
+from unittest.mock import Mock, patch
+import xml.etree.ElementTree as ET
+
+from scripts.arxiv_client import ArxivClient
+from scripts.models import Paper
+
+
+@pytest.fixture
+def client(test_dir):
+    """Create ArxivClient instance with rate limiting disabled."""
+    client = ArxivClient(test_dir)
+    client.min_delay = 0  # Disable rate limiting for tests
+    return client
+
+@pytest.fixture
+def arxiv_success_response():
+    """Sample successful arXiv API response."""
+    return '''<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom" 
+              xmlns:arxiv="http://arxiv.org/schemas/atom">
+            <entry>
+                <title>Test Paper Title</title>
+                <summary>Test Abstract</summary>
+                <author>
+                    <name>Test Author One</name>
+                </author>
+                <author>
+                    <name>Test Author Two</name>
+                </author>
+                <published>2024-01-01T00:00:00Z</published>
+                <link href="http://arxiv.org/abs/2401.00001" rel="alternate" type="text/html"/>
+                <arxiv:primary_category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+                <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+                <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+            </entry>
+        </feed>'''
+
+class TestArxivClient:
+    def test_get_paper_dir(self, client):
+        """Test paper directory creation."""
+        arxiv_id = "2401.00001"
+        paper_dir = client.get_paper_dir(arxiv_id)
+        
+        assert paper_dir.exists()
+        assert paper_dir.is_dir()
+        assert paper_dir.name == arxiv_id
+
+    def test_get_paper_status_empty(self, client):
+        """Test paper status for paper with no files."""
+        arxiv_id = "2401.00001"
+        client.get_paper_dir(arxiv_id)  # Create directory
+        
+        status = client.get_paper_status(arxiv_id)
+        assert status == {
+            "has_pdf": False,
+            "has_source": False,
+            "pdf_size": 0,
+            "source_size": 0
+        }
+
+    def test_get_paper_status_with_files(self, client):
+        """Test paper status with existing files."""
+        arxiv_id = "2401.00001"
+        paper_dir = client.get_paper_dir(arxiv_id)
+        
+        # Create dummy PDF
+        pdf_file = paper_dir / f"{arxiv_id}.pdf"
+        pdf_file.write_bytes(b"dummy pdf")
+        
+        # Create dummy source
+        source_dir = paper_dir / "source"
+        source_dir.mkdir()
+        (source_dir / "main.tex").write_text("dummy tex")
+        
+        status = client.get_paper_status(arxiv_id)
+        assert status["has_pdf"]
+        assert status["has_source"]
+        assert status["pdf_size"] > 0
+        assert status["source_size"] > 0
+    
+    def test_fetch_metadata_success(self, client, arxiv_success_response):
+        """Test successful metadata fetch with extended fields."""
+        with patch('requests.get') as mock_get:
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.text = arxiv_success_response
+            
+            paper = client.fetch_metadata("2401.00001")
+            
+            assert isinstance(paper, Paper)
+            assert paper.arxiv_id == "2401.00001"
+            assert paper.title == "Test Paper Title"
+            assert paper.authors == "Test Author One, Test Author Two"
+            assert paper.abstract == "Test Abstract"
+            assert "arxiv.org/abs/2401.00001" in paper.url
+            
+            # Check new fields
+            assert paper.published_date == "2024-01-01T00:00:00Z"
+            assert paper.arxiv_tags == ["cs.LG", "cs.AI"]
+            
+            # Verify API call
+            mock_get.assert_called_once()
+            args, kwargs = mock_get.call_args
+            assert "2401.00001" in args[0]
+            assert kwargs["headers"]["User-Agent"].startswith("ArxivPaperTracker")
+
+    def test_fetch_metadata_api_error(self, client):
+        """Test handling of API error responses."""
+        with patch('requests.get') as mock_get:
+            mock_get.return_value.status_code = 404
+            
+            with pytest.raises(ValueError, match="ArXiv API error: 404"):
+                client.fetch_metadata("2401.00001")
+
+    def test_fetch_metadata_invalid_xml(self, client):
+        """Test handling of invalid XML responses."""
+        with patch('requests.get') as mock_get:
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.text = "Invalid XML"
+            
+            with pytest.raises(ValueError, match="Invalid XML response"):
+                client.fetch_metadata("2401.00001")
+
+    def test_download_pdf_success(self, client):
+        """Test successful PDF download."""
+        arxiv_id = "2401.00001"
+        pdf_content = b"Test PDF content"
+        
+        with patch('requests.get') as mock_get:
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.content = pdf_content
+            
+            success = client.download_pdf(arxiv_id)
+            
+            assert success
+            paper_dir = client.get_paper_dir(arxiv_id)
+            pdf_file = paper_dir / f"{arxiv_id}.pdf"
+            assert pdf_file.exists()
+            assert pdf_file.read_bytes() == pdf_content
+
+    def test_download_pdf_failure(self, client):
+        """Test handling of PDF download failures."""
+        with patch('requests.get') as mock_get:
+            mock_get.return_value.status_code = 404
+            
+            success = client.download_pdf("2401.00001")
+            assert not success
+
+        def test_download_source_success(self, client):
+            """Test successful source download."""
+            arxiv_id = "2401.00001"
+            
+            # Create a test tar file
+            with tempfile.NamedTemporaryFile(suffix='.tar') as tmp_file:
+                with tarfile.open(tmp_file.name, 'w') as tar:
+                    content = b"Test TeX content"
+                    info = tarfile.TarInfo(name="main.tex")
+                    info.size = len(content)
+                    content_io = io.BytesIO(content)
+                    tar.addfile(info, content_io)
+                
+                with patch('requests.get') as mock_get:
+                    mock_get.return_value.status_code = 200
+                    mock_get.return_value.content = open(tmp_file.name, 'rb').read()
+                    
+                    success = client.download_source(arxiv_id)
+                    
+                    assert success
+                    source_dir = client.get_paper_dir(arxiv_id) / "source"
+                    assert source_dir.exists()
+                    assert (source_dir / "main.tex").exists()
+                    assert b"Test TeX content" in (source_dir / "main.tex").read_bytes()
+
+    def test_download_source_failure(self, client):
+        """Test handling of source download failures."""
+        with patch('requests.get') as mock_get:
+            mock_get.return_value.status_code = 404
+            
+            success = client.download_source("2401.00001")
+            assert not success
+
+    def test_download_paper_complete(self, client):
+        """Test downloading complete paper with PDF and source."""
+        arxiv_id = "2401.00001"
+        
+        with patch.object(client, 'download_pdf') as mock_pdf, \
+             patch.object(client, 'download_source') as mock_source:
+            
+            mock_pdf.return_value = True
+            mock_source.return_value = True
+            
+            success = client.download_paper(arxiv_id)
+            
+            assert success
+            mock_pdf.assert_called_once()
+            mock_source.assert_called_once()
+
+    def test_rate_limiting(self, client):
+        """Test rate limiting between requests."""
+        client.min_delay = 0.1  # Short delay for testing
+        
+        with patch('requests.get') as mock_get, \
+             patch('time.sleep') as mock_sleep:
+            
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.text = '''<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+        <entry>
+            <title>Test</title>
+            <summary>Test summary</summary>
+        </entry>
+    </feed>'''
+            
+            # Make multiple requests
+            for _ in range(3):
+                client.fetch_metadata("2401.00001")
+            
+            assert mock_sleep.call_count == 2  # Called between requests
+
+
+
+---
+File: tests/test_asset_manager.py
+---
+# tests/test_asset_manager.py
+import pytest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts.asset_manager import PaperAssetManager
+
+@pytest.fixture
+def manager(test_dir):
+    """Create AssetManager with mocked dependencies."""
+    with patch('scripts.arxiv_client.ArxivClient') as mock_arxiv, \
+         patch('scripts.markdown_service.MarkdownService') as mock_markdown:
+        
+        # Configure mock ArxivClient
+        mock_arxiv.return_value.get_paper_status.return_value = {
+            "has_pdf": False,
+            "has_source": False,
+        }
+        mock_arxiv.return_value.download_pdf.return_value = True
+        mock_arxiv.return_value.download_source.return_value = True
+        
+        # Configure mock MarkdownService
+        mock_markdown.return_value.get_conversion_status.return_value = {
+            "has_markdown": False,
+            "has_source": False,
+            "failed": False,
+        }
+        mock_markdown.return_value.convert_paper.return_value = True
+        
+        yield PaperAssetManager(
+            papers_dir=test_dir,
+            arxiv_client=mock_arxiv.return_value,
+            markdown_service=mock_markdown.return_value
+        )
+
+def test_ensure_all_assets(manager):
+    """Test processing all papers."""
+    # Create test papers
+    (manager.papers_dir / "2401.00001").mkdir()
+    (manager.papers_dir / "2401.00002").mkdir()
+    
+    # Set up mock behavior to create conditions for markdown conversion
+    def get_paper_status(arxiv_id):
+        # After "downloading" source files, report them as present
+        call_count = manager.arxiv.download_source.call_count
+        return {
+            "has_pdf": False,  # Always need PDF
+            "has_source": call_count > 0,  # Source exists after download
+        }
+    
+    def get_conversion_status(arxiv_id):
+        return {
+            "has_markdown": False,  # Always need markdown conversion
+            "has_source": True,  # Source files present
+            "failed": False,
+        }
+    
+    manager.arxiv.get_paper_status.side_effect = get_paper_status
+    manager.markdown.get_conversion_status.side_effect = get_conversion_status
+    
+    manager.ensure_all_assets()
+    
+    # Verify all operations were attempted
+    assert manager.arxiv.download_pdf.call_count == 2
+    assert manager.arxiv.download_source.call_count == 2
+    assert manager.markdown.convert_paper.call_count == 2
+
+def test_convert_markdown(manager):
+    """Test converting papers to markdown."""
+    # Create test papers
+    paper_dirs = ["2401.00001", "2401.00002"]
+    for name in paper_dirs:
+        (manager.papers_dir / name).mkdir()
+    
+    # Configure mock for papers with source
+    manager.arxiv.get_paper_status.return_value = {"has_pdf": True, "has_source": True}
+    manager.markdown.get_conversion_status.return_value = {
+        "has_markdown": False,
+        "has_source": True,
+        "failed": False,
+    }
+    
+    results = manager.convert_markdown()
+    assert len(results) == 2
+    assert all(results.values())
+    assert manager.markdown.convert_paper.call_count == 2
+
+
+
+---
+File: tests/test_github_client.py
+---
+# tests/test_github_client.py
+import pytest
+from unittest.mock import Mock, patch
+from scripts.github_client import GithubClient
+
+@pytest.fixture
+def client():
+    """Create GithubClient instance."""
+    return GithubClient(token="fake_token", repo="user/repo")
+
+class TestGithubClient:
+    def test_get_open_issues(self, client):
+        """Test fetching open issues."""
+        mock_response = [
+            {"labels": [{"name": "paper"}]},
+            {"labels": [{"name": "reading-session"}]},
+            {"labels": [{"name": "other"}]}
+        ]
+        
+        with patch('requests.get') as mock_get:
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.json.return_value = mock_response
+            
+            issues = client.get_open_issues()
+            
+            assert len(issues) == 2  # Only paper and reading-session issues
+            assert all(
+                any(label["name"] in ["paper", "reading-session"] 
+                    for label in issue["labels"]) 
+                for issue in issues
+            )
+            
+            # Verify API call
+            mock_get.assert_called_once()
+            args, kwargs = mock_get.call_args
+            assert "/issues" in args[0]
+            assert kwargs["params"]["state"] == "open"
+
+    def test_get_open_issues_error(self, client):
+        """Test handling API errors in issue fetching."""
+        with patch('requests.get') as mock_get:
+            mock_get.return_value.status_code = 404
+            
+            issues = client.get_open_issues()
+            assert issues == []  # Returns empty list on error
+
+    def test_close_issue_success(self, client):
+        """Test successful issue closing."""
+        with patch('requests.post') as mock_post, \
+             patch('requests.patch') as mock_patch:
+            
+            mock_post.return_value.status_code = 201  # Comment created
+            mock_patch.return_value.status_code = 200  # Issue closed
+            
+            success = client.close_issue(123)
+            
+            assert success
+            mock_post.assert_called_once()  # Comment added
+            mock_patch.assert_called_once()  # Issue closed
+
+    def test_close_issue_comment_error(self, client):
+        """Test handling comment creation error."""
+        with patch('requests.post') as mock_post:
+            mock_post.return_value.status_code = 404
+            
+            success = client.close_issue(123)
+            
+            assert not success
+            mock_post.assert_called_once()
+
+    def test_close_issue_close_error(self, client):
+        """Test handling issue closing error."""
+        with patch('requests.post') as mock_post, \
+             patch('requests.patch') as mock_patch:
+            
+            mock_post.return_value.status_code = 201
+            mock_patch.return_value.status_code = 404
+            
+            success = client.close_issue(123)
+            
+            assert not success
+            mock_post.assert_called_once()
+            mock_patch.assert_called_once()
+
+
+
+---
+File: tests/test_markdown_service.py
+---
+# tests/test_markdown_service.py
+import pytest
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+from unittest.mock import patch, MagicMock
+
+from scripts.markdown_service import MarkdownService
+from scripts.paper_manager import PaperManager
+
+@pytest.fixture
+def paper_manager(test_dir):
+    """Create PaperManager instance."""
+    return PaperManager(test_dir)
+
+@pytest.fixture
+def service(test_dir):
+    """Create MarkdownService instance."""
+    return MarkdownService(test_dir)
+
+@pytest.fixture
+def setup_metadata_with_tex(paper_dir):
+    """Setup metadata.json with main_tex_file specified."""
+    metadata = {
+        "arxivId": paper_dir.name,
+        "title": "Test Paper",
+        "authors": "Test Author",
+        "abstract": "Test abstract",
+        "url": "https://arxiv.org/abs/test",
+        "issue_number": 1,
+        "issue_url": "https://github.com/test/issue/1",
+        "created_at": "2024-01-01T00:00:00Z",
+        "state": "open",
+        "labels": [],
+        "main_tex_file": "source/main.tex"
+    }
+    metadata_file = paper_dir / "metadata.json"
+    metadata_file.write_text(json.dumps(metadata, indent=2))
+    return metadata_file
+
+class TestMarkdownService:
+    def test_convert_with_metadata_tex_file(self, service, source_dir, setup_metadata_with_tex, mock_pandoc):
+        """Test conversion using main_tex_file from metadata."""
+        paper_dir = source_dir.parent
+        main_tex = source_dir / "main.tex"
+        main_tex.write_text("\\documentclass{article}\n\\begin{document}\nTest\n\\end{document}")
+        
+        success = service.convert_paper(paper_dir.name)
+        assert success
+        assert (paper_dir / f"{paper_dir.name}.md").exists()
+
+    def test_convert_with_invalid_metadata_tex_file(self, service, source_dir, setup_metadata_with_tex):
+        """Test fallback when metadata specifies non-existent tex file."""
+        paper_dir = source_dir.parent
+        metadata = json.loads(setup_metadata_with_tex.read_text())
+        metadata["main_tex_file"] = "source/nonexistent.tex"
+        setup_metadata_with_tex.write_text(json.dumps(metadata, indent=2))
+        
+        # Should fall back to inference
+        success = service.convert_paper(paper_dir.name)
+        assert not success
+        assert paper_dir.name in service.failed_conversions
+
+    def test_convert_with_paper_manager_update(self, service, source_dir, paper_manager, mock_pandoc):
+        """Test conversion after updating main_tex_file via PaperManager."""
+        # Get paths from fixtures
+        paper_dir = source_dir.parent
+        main_tex = source_dir / "main.tex"
+        
+        # Create initial metadata using the paper directory name from fixture
+        from scripts.models import Paper
+        paper = Paper(
+            arxivId=paper_dir.name,
+            title="Test Paper",
+            authors="Test Author",
+            abstract="Test abstract", 
+            url=f"https://arxiv.org/abs/{paper_dir.name}",
+            issue_number=1,
+            issue_url=f"https://github.com/test/issue/1",
+            created_at="2024-01-01T00:00:00Z",
+            state="open",
+            labels=[]
+        )
+        
+        # Ensure clean state and create paper
+        import shutil
+        if paper_dir.exists():
+            shutil.rmtree(paper_dir)
+        paper_manager.create_paper(paper)
+        
+        # Recreate source directory and tex file
+        source_dir.mkdir(parents=True)
+        main_tex.write_text(r"""
+\documentclass{article}
+\begin{document}
+\title{Test Document}
+\maketitle
+\section{Introduction}
+Test content
+\end{document}
+""")
+        
+        # Update via PaperManager
+        paper_manager.update_main_tex_file(paper_dir.name, main_tex)
+        
+        # Verify conversion uses specified file
+        success = service.convert_paper(paper_dir.name)
+        assert success
+        assert (paper_dir / f"{paper_dir.name}.md").exists()
+    def test_convert_paper_success(self, service, source_dir, mock_pandoc):
+        """Test successful paper conversion."""
+        paper_dir = source_dir.parent
+        success = service.convert_paper(paper_dir.name)
+        assert success
+        assert (paper_dir / f"{paper_dir.name}.md").exists()
+
+    def test_convert_paper_no_source(self, service, paper_dir):
+        """Test conversion without source files."""
+        success = service.convert_paper(paper_dir.name)
+        assert not success
+        assert paper_dir.name in service.failed_conversions
+
+    def test_force_reconversion(self, service, source_dir, mock_pandoc):
+        """Test forced reconversion."""
+        paper_dir = source_dir.parent
+        arxiv_id = paper_dir.name
+        
+        # First conversion
+        markdown_file = paper_dir / f"{arxiv_id}.md"
+        service.convert_paper(arxiv_id)
+        assert markdown_file.exists()
+        
+        # Force reconversion
+        success = service.convert_paper(arxiv_id, force=True)
+        assert success
+        assert "Mock Pandoc Output" in markdown_file.read_text()
+
+    def test_skip_recent_failure(self, service, paper_dir):
+        """Test that recent failures are skipped."""
+        service._record_failure(paper_dir.name, "Test error")
+        success = service.convert_paper(paper_dir.name)
+        assert not success
+
+
+
+---
+File: tests/test_pandoc_utils.py
+---
+"""Tests for pandoc utilities and conversion process."""
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+from unittest.mock import Mock, patch
+import pytest
+from scripts.pandoc_utils import PandocConverter, PandocConfig, create_default_config
+
+# Register the integration mark to remove warnings
+pytest.mark.integration = pytest.mark.integration
+
+@pytest.fixture
+def mock_subprocess_run():
+    """Mock successful subprocess run."""
+    mock = Mock()
+    mock.return_value.returncode = 0
+    mock.return_value.stdout = "Success"
+    mock.return_value.stderr = ""
+    return mock
+
+@pytest.fixture
+def test_tex_content():
+    """Sample LaTeX content for testing."""
+    return r"""
+\documentclass{article}
+\begin{document}
+\title{Test Document}
+\maketitle
+\section{Introduction}
+Test content
+\end{document}
+"""
+
+# @pytest.fixture
+# def paper_dir(tmp_path):
+#     """Create a paper directory with necessary structure."""
+#     paper_dir = tmp_path / "papers/2203.15556"
+#     paper_dir.mkdir(parents=True)
+#     return paper_dir
+
+@pytest.fixture
+def source_dir(paper_dir, test_tex_content):  # Note: now properly using the fixture
+    """Create source directory with test TeX file."""
+    source_dir = paper_dir / "source"
+    source_dir.mkdir()
+    tex_file = source_dir / "main.tex"
+    tex_file.write_text(test_tex_content)  # Using the fixture value
+    return source_dir
+
+@pytest.fixture
+def converter(paper_dir):
+    """Create PandocConverter instance with test configuration."""
+    config = create_default_config(paper_dir)
+    return PandocConverter(config)
+
+def test_directory_creation(paper_dir, converter):
+    """Test that all necessary directories are created."""
+    media_dir = paper_dir / "media"
+    assert media_dir.exists(), "Media directory not created"
+    assert media_dir.is_dir(), "Media path is not a directory"
+
+def test_supporting_files_creation(paper_dir, converter):
+    """Test that all supporting files are created correctly."""
+    media_dir = paper_dir / "media"
+    
+    # Check Lua filter
+    lua_filter = media_dir / "crossref.lua"
+    assert lua_filter.exists(), "Lua filter not created"
+    content = lua_filter.read_text()
+    assert "function Math(elem)" in content, "Lua filter content incorrect"
+    
+    # Check metadata file
+    metadata_file = media_dir / "metadata.yaml"
+    assert metadata_file.exists(), "Metadata file not created"
+    content = metadata_file.read_text()
+    assert "reference-section-title" in content, "Metadata content incorrect"
+
+def test_file_verification(paper_dir, converter):
+    """Test file verification logic."""
+    assert converter._verify_files_exist(), "File verification failed"
+
+def test_pandoc_command_building(paper_dir, converter):
+    """Test pandoc command construction."""
+    input_file = Path("test.tex")
+    output_file = Path("test.md")
+    cmd = converter.build_pandoc_command(input_file, output_file)
+    
+    assert cmd[0] == "pandoc", "Command should start with pandoc"
+    assert f"--extract-media={converter.config.extract_media_dir}" in " ".join(cmd), \
+        "Media directory not properly configured"
+    assert "--metadata-file" in cmd, "Metadata file not included in command"
+    assert "--lua-filter" in cmd, "Lua filter not included in command"
+
+@pytest.mark.integration
+def test_full_conversion_process(paper_dir, source_dir, converter, mock_subprocess_run):
+    """Test the complete conversion process."""
+    with patch('subprocess.run', mock_subprocess_run):
+        input_file = source_dir / "main.tex"
+        output_file = paper_dir / "2203.15556.md"
+        
+        # Verify input exists
+        assert input_file.exists(), "Test TeX file not created"
+        
+        # Mock should create the output file to simulate pandoc behavior
+        def mock_pandoc_effect(*args, **kwargs):
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = "Success"
+            mock_result.stderr = ""
+            
+            # Get output file path from command args
+            output_path = args[0][args[0].index('-o') + 1]
+            # Simulate pandoc creating the output file
+            Path(output_path).write_text("# Test Output\nConverted content")
+            return mock_result
+        
+        mock_subprocess_run.side_effect = mock_pandoc_effect
+        
+        # Run conversion
+        try:
+            converter.convert_tex_to_markdown(input_file, output_file)
+        except Exception as e:
+            pytest.fail(f"Conversion failed with error: {e}")
+
+@pytest.mark.integration
+def test_real_pandoc_execution(paper_dir, source_dir, converter, test_tex_content):
+    """Test with actual pandoc execution."""
+    try:
+        # Verify pandoc is installed
+        result = subprocess.run(["pandoc", "--version"], 
+                              capture_output=True, text=True)
+        assert result.returncode == 0, "Pandoc not available"
+        
+        input_file = source_dir / "main.tex"
+        output_file = paper_dir / "2203.15556.md"
+        
+        # Write minimal test content
+        input_file.write_text(test_tex_content)
+        
+        # Run conversion
+        success = converter.convert_tex_to_markdown(input_file, output_file)
+        
+        # Print debug info if conversion fails
+        if not success:
+            print("\nDebug information:")
+            print(f"Input file exists: {input_file.exists()}")
+            print(f"Input file content:\n{input_file.read_text()}")
+            print(f"Media dir exists: {converter.config.extract_media_dir.exists()}")
+            print(f"Metadata file exists: {converter.config.metadata_file.exists()}")
+            if converter.config.metadata_file.exists():
+                print(f"Metadata content:\n{converter.config.metadata_file.read_text()}")
+            print(f"Lua filter exists: {converter.config.lua_filter.exists()}")
+            if converter.config.lua_filter.exists():
+                print(f"Lua filter content:\n{converter.config.lua_filter.read_text()}")
+        
+        assert success, "Real pandoc conversion failed"
+        assert output_file.exists(), "Output file not created"
+        assert output_file.stat().st_size > 0, "Output file is empty"
+        
+    except FileNotFoundError:
+        pytest.skip("Pandoc not installed")
+
+def test_error_handling(paper_dir, converter):
+    """Test error handling in various scenarios."""
+    
+    # Test with non-existent input file
+    with pytest.raises(FileNotFoundError, match="LaTeX file not found"):
+        converter.convert_tex_to_markdown(Path("nonexistent.tex"))
+
+def test_temporary_directory_cleanup(paper_dir, source_dir, converter):
+    """Test that temporary directory is properly cleaned up."""
+    temp_dirs_before = set(Path(tempfile.gettempdir()).iterdir())
+    
+    with patch('subprocess.run') as mock_run:
+        # Mock should create the output file
+        def mock_success(*args, **kwargs):
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = "Success"
+            mock_result.stderr = ""
+            
+            # Get output file path from command args
+            output_path = args[0][args[0].index('-o') + 1]
+            # Simulate pandoc creating the output file
+            Path(output_path).write_text("Mock output")
+            return mock_result
+            
+        mock_run.side_effect = mock_success
+        
+        try:
+            converter.convert_tex_to_markdown(
+                source_dir / "main.tex",
+                paper_dir / "output.md"
+            )
+        except Exception as e:
+            pytest.fail(f"Conversion failed with error: {e}")
+    
+    temp_dirs_after = set(Path(tempfile.gettempdir()).iterdir())
+    assert temp_dirs_before == temp_dirs_after, "Temporary directory not cleaned up"
+
+@pytest.mark.integration
+def test_minimal_pandoc_conversion(tmp_path):
+    """Test bare minimum pandoc conversion with real pandoc."""
+    try:
+        # Verify pandoc is installed
+        result = subprocess.run(["pandoc", "--version"], 
+                              capture_output=True, text=True)
+        if result.returncode != 0:
+            pytest.skip("Pandoc not installed")
+            
+        # Create test directory structure
+        paper_dir = tmp_path / "test_paper"
+        paper_dir.mkdir()
+        
+        # Create test LaTeX file
+        tex_file = paper_dir / "test.tex"
+        tex_file.write_text(r"""
+\documentclass{article}
+\begin{document}
+Test content
+\end{document}
+""")
+        
+        # Create output path
+        output_file = paper_dir / "test.md"
+        
+        # Run minimal pandoc command
+        cmd = [
+            'pandoc',
+            '-f', 'latex',
+            '-t', 'gfm',
+            '--standalone',
+            str(tex_file.resolve()),
+            '-o', str(output_file.resolve())
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        print(f"\nCommand: {' '.join(cmd)}")
+        print(f"Return code: {result.returncode}")
+        print(f"Stdout: {result.stdout}")
+        print(f"Stderr: {result.stderr}")
+        
+        assert result.returncode == 0, f"Pandoc failed: {result.stderr}"
+        assert output_file.exists(), "Output file not created"
+        content = output_file.read_text()
+        assert "Test content" in content, "Expected content not found"
+        
+    except FileNotFoundError:
+        pytest.skip("Pandoc not installed")
+
+if __name__ == "__main__":
+    pytest.main(["-v", "-s", __file__])
+
+
+
+---
+File: tests/test_paper_manager.py
+---
+import json
+import pytest
+from pathlib import Path
+from datetime import datetime
+from unittest.mock import Mock, patch
+
+from scripts.paper_manager import PaperManager
+from scripts.models import Paper, ReadingSession, PaperVisitEvent
+from scripts.arxiv_client import ArxivClient
+
+
+@pytest.fixture
+def manager(test_dir):
+    """Create PaperManager instance with test directory."""
+    return PaperManager(test_dir)
+
+
+class TestPaperManager:
+    def test_get_paper_not_found(self, manager):
+        """Test getting non-existent paper."""
+        with pytest.raises(FileNotFoundError):
+            manager.get_paper("2401.00001")
+
+    def test_create_and_get_paper(self, manager, sample_paper):
+        """Test creating and retrieving a paper."""
+        with patch.object(manager, '_needs_hydration', return_value=False):
+            manager.create_paper(sample_paper)
+            retrieved = manager.get_paper(sample_paper.arxiv_id)
+            assert retrieved.arxiv_id == sample_paper.arxiv_id
+            assert retrieved.title == sample_paper.title
+
+    def test_get_or_create_paper_existing(self, manager, sample_paper):
+        """Test get_or_create with existing paper."""
+        with patch.object(manager, '_needs_hydration', return_value=False):
+            manager.create_paper(sample_paper)
+            paper = manager.get_or_create_paper(sample_paper.arxiv_id)
+            assert paper.arxiv_id == sample_paper.arxiv_id
+            assert paper.title == sample_paper.title
+
+    def test_get_or_create_paper_new(self, manager):
+        """Test get_or_create fetches new paper."""
+        arxiv_id = "2401.00001"
+        with patch.object(ArxivClient, 'fetch_metadata') as mock_fetch, \
+             patch.object(manager, '_needs_hydration', return_value=False):
+            mock_fetch.return_value = Paper(
+                arxivId=arxiv_id,
+                title="New Paper",
+                authors="New Author",
+                abstract="New Abstract",
+                url=f"https://arxiv.org/abs/{arxiv_id}",
+                issue_number=1,
+                issue_url="https://github.com/user/repo/issues/1",
+                created_at=datetime.utcnow().isoformat(),
+                state="open",
+                labels=[],
+                total_reading_time_seconds=0
+            )
+            
+            paper = manager.get_or_create_paper(arxiv_id)
+            assert paper.arxiv_id == arxiv_id
+            assert paper.title == "New Paper"
+            mock_fetch.assert_called_once_with(arxiv_id)
+
+    def test_update_reading_time(self, manager, sample_paper):
+        """Test updating paper reading time."""
+        manager.create_paper(sample_paper)
+        duration = 300  # 5 minutes
+        
+        manager.update_reading_time(sample_paper.arxiv_id, duration)
+        paper = manager.get_paper(sample_paper.arxiv_id)
+        
+        assert paper.total_reading_time_seconds == duration
+        assert paper.last_read is not None
+
+    def test_append_event(self, manager, sample_paper):
+        """Test appending reading session event."""
+        manager.create_paper(sample_paper)
+        
+        event = ReadingSession(
+            arxivId=sample_paper.arxiv_id,
+            timestamp=datetime.utcnow().isoformat(),
+            duration_seconds=300,
+            issue_url="https://github.com/user/repo/issues/2"
+        )
+        
+        manager.append_event(sample_paper.arxiv_id, event)
+        
+        # Verify event was written
+        events_file = manager.data_dir / sample_paper.arxiv_id / manager._event_log_fname
+        assert events_file.exists()
+        
+        # Read and verify event content
+        events = [json.loads(line) for line in events_file.read_text().splitlines() if line.strip()]
+        assert len(events) == 2  # Should have registration and reading session events
+        
+        # Verify visit event
+        visit_event = events[0]
+        assert visit_event["type"] == "paper_visit"
+        assert visit_event["arxiv_id"] == sample_paper.arxiv_id
+        
+        # Verify reading session event
+        session_event = events[1]
+        assert session_event["type"] == "reading_session"
+        assert session_event["arxiv_id"] == sample_paper.arxiv_id
+        assert session_event["duration_seconds"] == 300
+
+    def test_modified_files_tracking(self, manager, sample_paper):
+        """Test tracking of modified files."""
+        manager.create_paper(sample_paper)
+        
+        # Check metadata file was tracked
+        metadata_path = str(manager.data_dir / sample_paper.arxiv_id / "metadata.json")
+        assert metadata_path in manager.get_modified_files()
+        
+        # Clear and verify
+        manager.clear_modified_files()
+        assert len(manager.get_modified_files()) == 0
+        
+        # Update and verify new modification tracked
+        manager.update_reading_time(sample_paper.arxiv_id, 300)
+        assert metadata_path in manager.get_modified_files()
+
+    def test_save_load_metadata(self, manager, sample_paper):
+        """Test metadata serialization."""
+        manager.save_metadata(sample_paper)
+        loaded = manager.load_metadata(sample_paper.arxiv_id)
+        
+        assert loaded.model_dump() == sample_paper.model_dump()
+    
+    def test_concurrent_event_writing(self, manager, sample_paper):
+        """Test concurrent writing of multiple events."""
+        manager.create_paper(sample_paper)
+        
+        # Create multiple events
+        events = [
+            ReadingSession(
+                arxivId=sample_paper.arxiv_id,
+                timestamp=f"2024-01-01T00:0{i}:00Z",
+                duration_seconds=30,
+                issue_url=f"https://example.com/{i}"
+            ) for i in range(10)
+        ]
+        
+        # Write events rapidly
+        for event in events:
+            manager.append_event(sample_paper.arxiv_id, event)
+        
+        # Verify integrity
+        events_file = manager.data_dir / sample_paper.arxiv_id / manager._event_log_fname
+        lines = events_file.read_text().splitlines()
+        assert len(lines) == len(events) + 1  # +1 for initial paper visit event
+        
+        # Verify each event was written correctly
+        for line in lines[1:]:  # Skip initial visit event
+            event_data = json.loads(line)
+            assert event_data["type"] == "reading_session"
+            assert event_data["duration_seconds"] == 30
+            assert event_data["arxiv_id"] == sample_paper.arxiv_id
+
+
+
+---
+File: tests/test_paper_manager_hydration.py
+---
+# tests/test_paper_manager.py
+import json
+import pytest
+from pathlib import Path
+from datetime import datetime
+from unittest.mock import Mock, patch
+
+from scripts.models import Paper
+from scripts.paper_manager import PaperManager
+
+
+@pytest.fixture
+def manager(test_dir):
+    """Create PaperManager instance with test directory."""
+    return PaperManager(test_dir)
+
+@pytest.fixture
+def paper_with_missing_fields(sample_paper):
+    """Create paper missing optional metadata fields."""
+    paper_dict = sample_paper.model_dump()
+    paper_dict["published_date"] = None
+    paper_dict["arxiv_tags"] = None
+    return Paper.model_validate(paper_dict)
+
+@pytest.fixture
+def complete_paper(sample_paper):
+    """Create paper with all metadata fields."""
+    paper_dict = sample_paper.model_dump()
+    paper_dict["published_date"] = "2024-01-01T00:00:00Z"
+    paper_dict["arxiv_tags"] = ["cs.LG", "cs.AI"]
+    return Paper.model_validate(paper_dict)
+
+class TestPaperManagerHydration:
+    def test_needs_hydration_missing_fields(self, manager, paper_with_missing_fields):
+        """Test hydration check with missing fields."""
+        assert manager._needs_hydration(paper_with_missing_fields)
+        
+    def test_needs_hydration_complete(self, manager, complete_paper):
+        """Test hydration check with complete metadata."""
+        assert not manager._needs_hydration(complete_paper)
+        
+    def test_needs_hydration_empty_tags(self, manager, complete_paper):
+        """Test hydration check with empty tags list."""
+        paper_dict = complete_paper.model_dump()
+        paper_dict["arxiv_tags"] = []
+        paper = Paper.model_validate(paper_dict)
+        assert manager._needs_hydration(paper)
+
+    def test_hydrate_metadata_success(self, manager, paper_with_missing_fields, complete_paper):
+        """Test successful metadata hydration."""
+        with patch.object(manager.arxiv_client, 'fetch_metadata', return_value=complete_paper):
+            hydrated = manager._hydrate_metadata(paper_with_missing_fields)
+            
+            # Check new fields were added
+            assert hydrated.published_date == complete_paper.published_date
+            assert hydrated.arxiv_tags == complete_paper.arxiv_tags
+            
+            # Check existing fields were preserved
+            assert hydrated.total_reading_time_seconds == paper_with_missing_fields.total_reading_time_seconds
+            assert hydrated.issue_number == paper_with_missing_fields.issue_number
+
+    def test_hydrate_metadata_failure(self, manager, paper_with_missing_fields):
+        """Test handling of hydration failure."""
+        with patch.object(manager.arxiv_client, 'fetch_metadata', side_effect=Exception("API Error")):
+            result = manager._hydrate_metadata(paper_with_missing_fields)
+            # Should return original paper on failure
+            assert result == paper_with_missing_fields
+
+    def test_get_paper_triggers_hydration(self, manager, paper_with_missing_fields):
+        """Test that get_paper initiates hydration when needed."""
+        # Save paper with missing fields
+        manager.save_metadata(paper_with_missing_fields)
+        
+        # Mock the hydration
+        complete = paper_with_missing_fields.model_copy()
+        complete.published_date = "2024-01-01T00:00:00Z"
+        complete.arxiv_tags = ["cs.LG"]
+        
+        with patch.object(manager.arxiv_client, 'fetch_metadata', return_value=complete):
+            paper = manager.get_paper(paper_with_missing_fields.arxiv_id)
+            assert paper.published_date is not None
+            assert paper.arxiv_tags is not None
+            
+            # Verify metadata file was updated
+            loaded = manager.load_metadata(paper.arxiv_id)
+            assert loaded.published_date == complete.published_date
+            assert loaded.arxiv_tags == complete.arxiv_tags
+
+    def test_create_paper_with_hydration(self, manager, paper_with_missing_fields, complete_paper):
+        """Test that create_paper performs hydration."""
+        with patch.object(manager.arxiv_client, 'fetch_metadata', return_value=complete_paper):
+            manager.create_paper(paper_with_missing_fields)
+            
+            # Load and verify metadata was hydrated
+            paper = manager.load_metadata(paper_with_missing_fields.arxiv_id)
+            assert paper.published_date == complete_paper.published_date
+            assert paper.arxiv_tags == complete_paper.arxiv_tags
+
+
+
+---
+File: tests/test_process_events.py
+---
+# tests/test_process_events.py
+import json
+import yaml
+import pytest
+from pathlib import Path
+from datetime import datetime
+from unittest.mock import Mock, patch
+
+from scripts.process_events import EventProcessor
+from scripts.models import Paper
+
+
+@pytest.fixture
+def sample_paper_issue(sample_paper):
+    """Create sample paper registration issue."""
+    return {
+        "number": 1,
+        "html_url": "https://github.com/user/repo/issues/1",
+        "state": "open",
+        "labels": [{"name": "paper"}],
+        "body": json.dumps({
+            "arxivId": sample_paper.arxiv_id,
+            "title": sample_paper.title,
+            "authors": sample_paper.authors,
+            "abstract": sample_paper.abstract,
+            "url": sample_paper.url
+        })
+    }
+
+@pytest.fixture
+def event_processor(tmp_path):
+    """Create EventProcessor with temp directory."""
+    with patch.dict('os.environ', {
+        'GITHUB_TOKEN': 'fake_token',
+        'GITHUB_REPOSITORY': 'user/repo'
+    }):
+        processor = EventProcessor()
+        processor.papers_dir = tmp_path / "papers"
+        processor.papers_dir.mkdir(parents=True)
+        return processor
+
+class TestEventProcessor:
+    def test_process_paper_issue(self, event_processor, sample_paper_issue, sample_paper):
+        """Test processing paper registration issue."""
+        with patch('scripts.paper_manager.PaperManager.get_or_create_paper', return_value=sample_paper):
+            success = event_processor.process_paper_issue(sample_paper_issue)
+            
+            assert success
+            assert sample_paper_issue["number"] in event_processor.processed_issues
+
+    def test_process_reading_issue(self, event_processor, sample_paper):
+        """Test processing reading session issue."""
+        issue_data = {
+            "number": 2,
+            "html_url": "https://github.com/user/repo/issues/2",
+            "labels": [{"name": "reading-session"}],
+            "body": json.dumps({
+                "arxivId": sample_paper.arxiv_id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "duration_seconds": 30
+            })
+        }
+        
+        with patch('scripts.paper_manager.PaperManager.get_or_create_paper', return_value=sample_paper), \
+             patch('scripts.paper_manager.PaperManager.update_reading_time'), \
+             patch('scripts.paper_manager.PaperManager.append_event'):
+            
+            success = event_processor.process_reading_issue(issue_data)
+            assert success
+            assert issue_data["number"] in event_processor.processed_issues
+
+    def test_process_reading_issue_invalid_data(self, event_processor):
+        """Test processing invalid reading session data."""
+        invalid_issue = {
+            "number": 1,
+            "html_url": "https://github.com/user/repo/issues/1",
+            "labels": [{"name": "reading-session"}],
+            "body": "invalid json"
+        }
+        
+        success = event_processor.process_reading_issue(invalid_issue)
+        assert not success
+        assert 1 not in event_processor.processed_issues
+
+    def test_update_registry(self, event_processor, sample_paper, tmp_path):
+        """Test updating registry file."""
+        # Setup: create paper and mark as modified
+        paper_dir = event_processor.papers_dir / sample_paper.arxiv_id
+        paper_dir.mkdir(parents=True)
+        event_processor.paper_manager.save_metadata(sample_paper)
+        
+        event_processor.update_registry()
+        
+        registry_file = event_processor.papers_dir / "papers.yaml"
+        assert registry_file.exists()
+        with registry_file.open() as f:
+            registry_data = yaml.safe_load(f)
+        assert sample_paper.arxiv_id in registry_data
+
+    def test_process_all_issues(self, event_processor, sample_paper_issue):
+        """Test processing multiple issue types."""
+        with patch('scripts.github_client.GithubClient.get_open_issues') as mock_get_issues, \
+             patch('scripts.github_client.GithubClient.close_issue') as mock_close_issue, \
+             patch('scripts.paper_manager.PaperManager.get_or_create_paper') as mock_get_paper, \
+             patch('scripts.process_events.commit_and_push'):
+            
+            # Configure mocks
+            mock_get_issues.return_value = [sample_paper_issue]
+            mock_close_issue.return_value = True
+            
+            # Parse JSON from issue body
+            issue_data = json.loads(sample_paper_issue["body"])
+            mock_get_paper.return_value = Paper(
+                arxivId=issue_data["arxivId"],
+                title=issue_data["title"],
+                authors=issue_data["authors"], 
+                abstract=issue_data["abstract"],
+                url=issue_data["url"],
+                issue_number=sample_paper_issue["number"],
+                issue_url=sample_paper_issue["html_url"],
+                created_at=datetime.utcnow().isoformat(),
+                state="open",
+                labels=["paper"],
+                total_reading_time_seconds=0,
+                last_read=None
+            )
+            
+            event_processor.process_all_issues()
+            
+            assert len(event_processor.processed_issues) == 1
+            mock_get_issues.assert_called_once()
+            mock_close_issue.assert_called_once()
+            mock_get_paper.assert_called_once()
+
+    def test_process_no_issues(self, event_processor):
+        """Test behavior when no issues exist."""
+        with patch('scripts.github_client.GithubClient.get_open_issues') as mock_get_issues:
+            mock_get_issues.return_value = []
+            
+            event_processor.process_all_issues()
+            assert len(event_processor.processed_issues) == 0
+            mock_get_issues.assert_called_once()
+
+    def test_github_api_error(self, event_processor):
+        """Test handling of GitHub API errors."""
+        with patch('scripts.github_client.GithubClient.get_open_issues') as mock_get_issues:
+            mock_get_issues.return_value = []  # API error returns empty list
+            
+            event_processor.process_all_issues()
+            assert len(event_processor.processed_issues) == 0
+
+
+
+---
+File: tests/test_tex_utils.py
+---
+# tests/test_tex_utils.py
+"""Tests for TeX utilities."""
+
+import pytest
+from pathlib import Path
+from scripts.tex_utils import find_main_tex_file, score_tex_file
+
+@pytest.fixture
+def tex_dir(tmp_path):
+    """Create a temporary directory with test TeX files."""
+    tex_dir = tmp_path / "tex"
+    tex_dir.mkdir()
+    return tex_dir
+
+def create_tex_file(directory: Path, name: str, content: str) -> Path:
+    """Helper to create a TeX file with given content."""
+    file_path = directory / name
+    file_path.write_text(content)
+    return file_path
+
+def test_score_tex_file(tex_dir):
+    # Create test file with various indicators
+    content = r"""
+\documentclass{article}
+\begin{document}
+\title{Test Paper}
+\author{Test Author}
+\maketitle
+\section{Introduction}
+Test content
+\end{document}
+"""
+    tex_file = create_tex_file(tex_dir, "main.tex", content)
+    
+    result = score_tex_file(tex_file)
+    assert result.score > 0
+    assert any("documentclass" in r for r in result.reasons)
+    assert any("Main filename" in r for r in result.reasons)
+
+def test_find_main_tex_file_simple(tex_dir):
+    # Create main file
+    main_content = r"""
+\documentclass{article}
+\begin{document}
+\title{Main Paper}
+\end{document}
+"""
+    main_file = create_tex_file(tex_dir, "main.tex", main_content)
+    
+    # Create supplementary file
+    supp_content = r"""
+\documentclass{article}
+\begin{document}
+\section{Appendix}
+\end{document}
+"""
+    supp_file = create_tex_file(tex_dir, "supplement.tex", supp_content)
+    
+    result = find_main_tex_file([main_file, supp_file])
+    assert result == main_file
+
+def test_find_main_tex_file_ml_conference(tex_dir):
+    # Create conference submission file
+    conf_content = r"""
+\documentclass{neurips_2024}
+\begin{document}
+\title{Deep Learning Paper}
+\end{document}
+"""
+    conf_file = create_tex_file(tex_dir, "neurips_conference.tex", conf_content)
+    
+    result = find_main_tex_file([conf_file])
+    assert result == conf_file
+
+def test_find_main_tex_file_empty_list():
+    assert find_main_tex_file([]) is None
+
+def test_score_tex_file_with_inputs(tex_dir):
+    # Test file with multiple inputs (should get penalty)
+    content = r"""
+\documentclass{article}
+\begin{document}
+\input{intro}
+\input{methods}
+\input{results}
+\end{document}
+"""
+    tex_file = create_tex_file(tex_dir, "main.tex", content)
+    
+    result = score_tex_file(tex_file)
+    assert any("Input/include commands" in r for r in result.reasons)
+    assert any(r.startswith("Input/include commands (-") for r in result.reasons)
+
+
